@@ -1,0 +1,4 @@
+.env
+raw/
+venv/
+__pycache__/
