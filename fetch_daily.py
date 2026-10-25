@@ -12,13 +12,22 @@ for the same date is safe (the newest complete fetch wins). Missed days are
 not caught up here: Airflow runs this once per date, including dates it
 missed; older gaps are filled by backfill.py.
 
+Change detection: before a day file is replaced, the new fetch is compared
+with it game by game. A summary is logged, and a change report is written
+to raw/changes/ (which games changed, old and new values, new or removed
+games, and fields that appeared in or disappeared from the API data).
+
 Rules:
     - Only finished days: the date must be yesterday (UTC) or earlier.
     - QUOTA_RESERVE is ignored (that reserve exists for this job); the run
       stops only when the quota is used up.
     - An incomplete fetch (fewer matches returned than the API's total) is
       not saved, so it never replaces a good file.
-    - Any failure exits with code 1, so Airflow marks the task failed.
+    - Any fetch or save failure exits with code 1, so Airflow marks the
+      task failed.
+    - Change detection never fails the run: changes are information, not
+      errors. If the comparison itself breaks, the error is logged and the
+      new fetch is still saved.
 
 Settings (.env):
     HIGHLIGHTLY_API_KEY   API key
@@ -28,9 +37,11 @@ Usage (run from the project folder, with the venv active):
     python fetch_daily.py 2026-10-23    # 2026-10-23 and 2026-10-22
 
 Then load the files with:
-    python load_games.py
+    python load_games.py 2026-10-22
+    python load_games.py 2026-10-23
 """
 
+import json
 import logging
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -41,11 +52,16 @@ from dotenv import load_dotenv
 from highlightly_client import (
     PROJECT_DIR,
     QuotaExhausted,
+    compare_days,
+    day_file,
     fetch_day,
     get_api_key,
+    load_day,
+    log_change_report,
     log_day_result,
     make_session,
     new_quota,
+    save_change_report,
     save_day,
 )
 
@@ -76,6 +92,29 @@ def target_date(args):
         log.error("%s is not finished yet in UTC - the latest day allowed is %s", chosen, yesterday)
         sys.exit(1)
     return chosen
+
+
+def read_previous(match_date):
+    """
+    The day file that the new fetch will replace, or None if it cannot be
+    read. An unreadable file is logged and skipped for comparison - it is
+    about to be replaced by a good fetch anyway.
+    """
+    try:
+        return load_day(match_date)
+    except (OSError, json.JSONDecodeError):
+        log.exception("%s: could not read the existing file - no comparison for this day", match_date)
+        return None
+
+
+def report_changes(match_date, previous, payload):
+    """Compare, write the change report and log it. Never raises."""
+    try:
+        report = compare_days(previous, payload)
+        path = save_change_report(report)
+        log_change_report(log, report, path)
+    except Exception:
+        log.exception("%s: change detection failed - the new fetch was saved anyway", match_date)
 
 
 def main():
@@ -109,8 +148,15 @@ def main():
             failed = True
             continue
 
+        had_file = day_file(match_date).exists()
+        previous = read_previous(match_date) if had_file else None
         save_day(payload)
         saved += 1
+
+        if not had_file:
+            log.info("%s: first fetch of this day - nothing to compare", match_date)
+        elif previous is not None:
+            report_changes(match_date, previous, payload)
 
     log.info(
         "done: %d of %d days saved, %d requests used, quota left %s",
