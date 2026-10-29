@@ -125,3 +125,12 @@ CREATE TABLE IF NOT EXISTS basketball.international_leagues (
     league_name  TEXT    NOT NULL,
     note         TEXT
 );
+
+CREATE TABLE IF NOT EXISTS basketball.league_corrections (
+    match_id    BIGINT       PRIMARY KEY,
+    league_id   BIGINT       NOT NULL,
+    league      TEXT         NOT NULL,
+    country     TEXT         NOT NULL,
+    reason      TEXT         NOT NULL,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
