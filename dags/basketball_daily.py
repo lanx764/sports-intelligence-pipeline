@@ -4,6 +4,7 @@ basketball_daily
 Daily pipeline for the Basketball Intelligence System:
 
     fetch_daily  ->  load_games  ->  run_checks  ->  notify_success
+                                     run_checks  ->  ping_healthcheck
 
 Each of the first three tasks runs one of the project's scripts as a command
 inside the Airflow container, from /opt/airflow/project (the mounted project
@@ -26,6 +27,14 @@ Slack (channel #pipeline-alerts, webhook URL in SLACK_WEBHOOK_URL):
       a green message. No green message by about 08:00 Lagos time means the
       run needs a look.
 
+Healthchecks.io (dead man's switch, URL in HEALTHCHECK_PING_URL):
+    - ping_healthcheck runs only when everything before it succeeded and pings
+      the check. If no ping arrives by the check's deadline, Healthchecks.io
+      posts to Slack itself, which also covers a run that never started
+      (laptop asleep, Docker down). It is its own task, in parallel with
+      notify_success, so a Slack problem never stops the ping and the other
+      way round.
+
 Old gaps are filled by backfill.py, not by this DAG.
 """
 
@@ -34,6 +43,7 @@ import os
 from datetime import date, timedelta, timezone
 
 import pendulum
+from healthcheck_ping import ping_healthcheck
 from slack_alert import SlackAlertError, send_slack
 
 from airflow.providers.standard.operators.bash import BashOperator
@@ -56,6 +66,10 @@ FAILURE_HINTS = {
     "load_games": "Read the traceback in the log. run_checks did not run.",
     "run_checks": "The games were loaded, but a check failed. Look for ERROR lines in the log.",
     "notify_success": "The pipeline itself finished. Only the success message failed to send.",
+    "ping_healthcheck": (
+        "The pipeline itself finished. Only the ping to Healthchecks.io failed. "
+        "If it stays broken, Healthchecks.io will report the check as late."
+    ),
 }
 
 SUMMARY_SQL = """
@@ -194,4 +208,11 @@ with DAG(
         retry_delay=timedelta(minutes=2),
     )
 
-    fetch_daily >> load_games >> run_checks >> notify_success_task  
+    ping_healthcheck_task = PythonOperator(
+        task_id="ping_healthcheck",
+        python_callable=ping_healthcheck,
+        retries=2,
+        retry_delay=timedelta(minutes=2),
+    )
+
+    fetch_daily >> load_games >> run_checks >> [notify_success_task, ping_healthcheck_task]
