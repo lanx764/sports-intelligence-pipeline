@@ -8,7 +8,11 @@ When a game that was quarantined earlier now loads cleanly (for example
 after a rule or a lookup table was fixed), its open quarantine rows are
 marked 'fixed'.
 
-Two small lookup tables in the database drive special cases:
+Three small lookup tables in the database drive special cases:
+  - basketball.league_corrections: games the API filed under the wrong
+    league (match_id -> true league_id, league, country). The correction is
+    applied first, so every rule below sees the true league. The raw files
+    are never changed.
   - basketball.club_id_overrides: API team ids shared by different clubs
     (api_team_id + league_id -> club_id). A game involving a shared id in a
     league that is not listed is quarantined.
@@ -25,6 +29,9 @@ Usage (run from the project folder, with the venv active):
 
 Safe to re-run: fact_games is upserted on match_id, and quarantine
 rows are de-duplicated on (match_id, reason).
+
+After a full load, a league correction whose match_id was not found in any
+raw file is reported as a warning (most likely a mistyped id).
 """
 
 import json
@@ -68,6 +75,8 @@ FACT_COLUMNS = (
     "home_final", "away_final",
 )
 
+STAT_KEYS = ("rows", "loaded", "quarantined", "filtered", "resolved", "corrected")
+
 columns_sql = ", ".join(FACT_COLUMNS)
 values_sql = ", ".join(f"%({column})s" for column in FACT_COLUMNS)
 updates_sql = ",\n    ".join(
@@ -103,6 +112,11 @@ FROM basketball.club_id_overrides
 HALF_STYLE_SQL = """
 SELECT league_id
 FROM basketball.half_style_leagues
+"""
+
+CORRECTIONS_SQL = """
+SELECT match_id, league_id, league, country
+FROM basketball.league_corrections
 """
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -230,8 +244,20 @@ def read_half(score, quarters, first, second):
     return present[0]
 
 
-def build_row(match, resolver, half_style_ids):
+def league_of(match, correction):
+    """
+    The league and country to use for a game: the correction if there is
+    one (league_id, league, country), otherwise what the API sent.
+    """
+    if correction is not None:
+        return correction
+    country = match.country.name if match.country else None
+    return match.league.id, match.league.name, country
+
+
+def build_row(match, resolver, half_style_ids, correction=None):
     """Turn one validated finished match into one fact_games row."""
+    league_id, league_name, country = league_of(match, correction)
     score = match.state.score
 
     home_final, away_final = parse_score("current", score.current)
@@ -244,7 +270,7 @@ def build_row(match, resolver, half_style_ids):
     if match.state.description == OVERTIME_STATE and home_ot is None:
         raise QuarantineError("finished after over time but overTime score missing")
 
-    if match.league.id in half_style_ids:
+    if league_id in half_style_ids:
         # Two halves, not four quarters: keep only the halves.
         home_h1, away_h1 = read_half(score, quarters, "q1", "q2")
         home_h2, away_h2 = read_half(score, quarters, "q3", "q4")
@@ -280,8 +306,8 @@ def build_row(match, resolver, half_style_ids):
     if match.homeTeam.id == match.awayTeam.id:
         raise QuarantineError("home and away team ids are the same")
 
-    home_club_id = resolver.resolve(match.homeTeam.id, match.league.id)
-    away_club_id = resolver.resolve(match.awayTeam.id, match.league.id)
+    home_club_id = resolver.resolve(match.homeTeam.id, league_id)
+    away_club_id = resolver.resolve(match.awayTeam.id, league_id)
 
     kickoff = match.date
     if kickoff.tzinfo is None:
@@ -292,9 +318,9 @@ def build_row(match, resolver, half_style_ids):
         "match_id": match.id,
         "match_date": kickoff.date(),
         "match_time": kickoff.time(),
-        "country": match.country.name if match.country else None,
-        "league_id": match.league.id,
-        "league": match.league.name,
+        "country": country,
+        "league_id": league_id,
+        "league": league_name,
         "season": match.league.season,
         "home_team_id": match.homeTeam.id,
         "away_team_id": match.awayTeam.id,
@@ -325,8 +351,12 @@ def build_row(match, resolver, half_style_ids):
 # ---------------------------------------------------------------------------
 # Load
 # ---------------------------------------------------------------------------
-def process_file(conn, path, resolver, half_style_ids):
-    """Load one raw day file in one transaction. Returns row counts."""
+def process_file(conn, path, resolver, half_style_ids, corrections, seen_corrections):
+    """
+    Load one raw day file in one transaction. Returns row counts.
+    Every match id in the file that has a league correction is added to
+    seen_corrections, so main() can report corrections that matched nothing.
+    """
     payload = json.loads(path.read_text(encoding="utf-8"))
     matches = payload.get("matches")
     if not isinstance(matches, list):
@@ -340,17 +370,22 @@ def process_file(conn, path, resolver, half_style_ids):
             path.name, returned_count, total_count,
         )
 
-    stats = {"rows": len(matches), "loaded": 0, "quarantined": 0, "filtered": 0, "resolved": 0}
+    stats = dict.fromkeys(STAT_KEYS, 0)
+    stats["rows"] = len(matches)
 
     with conn.transaction(), conn.cursor() as cur:
         for raw in matches:
+            correction = corrections.get(raw.get("id"))
+            if correction is not None:
+                seen_corrections.add(raw.get("id"))
+
             state = (raw.get("state") or {}).get("description")
             if state not in FINISHED_STATES:
                 stats["filtered"] += 1
                 continue
 
             try:
-                row = build_row(Match.model_validate(raw), resolver, half_style_ids)
+                row = build_row(Match.model_validate(raw), resolver, half_style_ids, correction)
             except ValidationError as err:
                 first = err.errors()[0]
                 field = ".".join(str(part) for part in first["loc"])
@@ -360,6 +395,8 @@ def process_file(conn, path, resolver, half_style_ids):
             else:
                 cur.execute(UPSERT_SQL, row)
                 stats["loaded"] += 1
+                if correction is not None:
+                    stats["corrected"] += 1
 
                 cur.execute(RESOLVE_QUARANTINE_SQL, (row["match_id"],))
                 if cur.rowcount:
@@ -422,46 +459,75 @@ def files_to_load(args):
     return files
 
 
+def read_lookups(conn):
+    """Read the three lookup tables once, before any file is loaded."""
+    with conn.cursor() as cur:
+        cur.execute(OVERRIDES_SQL)
+        resolver = ClubResolver(cur.fetchall())
+        cur.execute(HALF_STYLE_SQL)
+        half_style_ids = frozenset(league_id for (league_id,) in cur.fetchall())
+        cur.execute(CORRECTIONS_SQL)
+        corrections = {
+            match_id: (league_id, league, country)
+            for match_id, league_id, league, country in cur.fetchall()
+        }
+
+    log.info(
+        "club_id_overrides: %d rows, %d shared api ids; half_style_leagues: %d leagues; "
+        "league_corrections: %d rows",
+        len(resolver.overrides), len(resolver.shared_ids), len(half_style_ids), len(corrections),
+    )
+    return resolver, half_style_ids, corrections
+
+
 def main():
     load_dotenv(PROJECT_DIR / ".env")
-    files = files_to_load(sys.argv[1:])
+    args = sys.argv[1:]
+    files = files_to_load(args)
     settings = get_db_settings()
 
-    totals = {"rows": 0, "loaded": 0, "quarantined": 0, "filtered": 0, "resolved": 0}
+    totals = dict.fromkeys(STAT_KEYS, 0)
     failed = []
+    seen_corrections = set()
 
     with psycopg.connect(**settings, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute(OVERRIDES_SQL)
-            resolver = ClubResolver(cur.fetchall())
-            cur.execute(HALF_STYLE_SQL)
-            half_style_ids = frozenset(league_id for (league_id,) in cur.fetchall())
-        log.info(
-            "club_id_overrides: %d rows, %d shared api ids; half_style_leagues: %d leagues",
-            len(resolver.overrides), len(resolver.shared_ids), len(half_style_ids),
-        )
+        resolver, half_style_ids, corrections = read_lookups(conn)
 
         for path in files:
             try:
-                stats = process_file(conn, path, resolver, half_style_ids)
+                stats = process_file(
+                    conn, path, resolver, half_style_ids, corrections, seen_corrections
+                )
             except Exception:
                 log.exception("%s: failed - nothing from this file was loaded", path.name)
                 failed.append(path.name)
                 continue
 
             log.info(
-                "%s: %d rows -> %d loaded, %d quarantined, %d not finished",
-                path.name, stats["rows"], stats["loaded"], stats["quarantined"], stats["filtered"],
+                "%s: %d rows -> %d loaded, %d quarantined, %d not finished, "
+                "%d league corrections",
+                path.name, stats["rows"], stats["loaded"], stats["quarantined"],
+                stats["filtered"], stats["corrected"],
             )
             for key in totals:
                 totals[key] += stats[key]
 
     log.info(
         "done: %d files, %d rows -> %d loaded, %d quarantined, %d not finished, "
-        "%d quarantine rows marked fixed",
+        "%d quarantine rows marked fixed, %d league corrections applied",
         len(files) - len(failed), totals["rows"], totals["loaded"],
-        totals["quarantined"], totals["filtered"], totals["resolved"],
+        totals["quarantined"], totals["filtered"], totals["resolved"], totals["corrected"],
     )
+
+    # Only a full load sees every raw file, so only then can an unused
+    # correction be reported. A failed file may hold the missing match.
+    if not args and not failed:
+        unused = sorted(set(corrections) - seen_corrections)
+        if unused:
+            log.warning(
+                "%d league corrections matched no game in raw/matches (mistyped match_id?): %s",
+                len(unused), ", ".join(str(match_id) for match_id in unused),
+            )
 
     if failed:
         log.error("failed files: %s", ", ".join(failed))
