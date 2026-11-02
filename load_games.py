@@ -8,11 +8,29 @@ When a game that was quarantined earlier now loads cleanly (for example
 after a rule or a lookup table was fixed), its open quarantine rows are
 marked 'fixed'.
 
-Three small lookup tables in the database drive special cases:
+Games whose result is not a normal played result go to
+basketball.abnormal_results, each with the reason (the rule) that caught
+it, and are removed from basketball.fact_games if an earlier run put them
+there, so fact_games only ever holds normal played games. Today there is
+one rule: a team cannot score 0 in a played game, so a finished game where
+either team has a final score of 0, with no quarter scores and no overtime
+score, is a walkover, forfeit, abandoned game or similar (the API usually
+records 20 - 0 or 0 - 20; 3 - 0, 0 - 2 and 0 - 10 have also been seen).
+These games skip the club lookup, so a shared team id cannot quarantine
+them.
+
+Four small lookup tables in the database drive special cases:
   - basketball.league_corrections: games the API filed under the wrong
     league (match_id -> true league_id, league, country). The correction is
     applied first, so every rule below sees the true league. The raw files
     are never changed.
+  - basketball.club_corrections: single games where the API used one team id
+    for two different clubs inside the same league, so (api_team_id,
+    league_id) cannot tell them apart. One row says which club one side of
+    one game really is (match_id + side -> club_id). A correction wins over
+    club_id_overrides. It also stores the api_team_id it expects on that
+    side; if the game has a different team there, the game is quarantined
+    instead of getting a wrong club.
   - basketball.club_id_overrides: API team ids shared by different clubs
     (api_team_id + league_id -> club_id). A game involving a shared id in a
     league that is not listed is quarantined.
@@ -27,11 +45,15 @@ Usage (run from the project folder, with the venv active):
     python load_games.py               # load every file in raw/matches
     python load_games.py 2026-10-23    # load one day only
 
-Safe to re-run: fact_games is upserted on match_id, and quarantine
-rows are de-duplicated on (match_id, reason).
+Safe to re-run: fact_games and abnormal_results are upserted on match_id,
+and quarantine rows are de-duplicated on (match_id, reason).
 
-After a full load, a league correction whose match_id was not found in any
-raw file is reported as a warning (most likely a mistyped id).
+After a full load, a league or club correction whose match_id was not found
+in any raw file is reported as a warning (most likely a mistyped id).
+
+Known limit: a game already in abnormal_results is not removed from it if a
+later raw file turns it into a normal game (for example the API adds
+quarter scores). That should be caught by a check, not by the loader.
 """
 
 import json
@@ -59,6 +81,7 @@ OVERTIME_STATE = "Finished after over time"
 SCORE_PATTERN = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
 QUARTERS = ("q1", "q2", "q3", "q4")
 NO_SCORE = ((0, 0), (None, None))
+ZERO_SCORE_REASON = "team scored 0, no quarter scores, no overtime"
 REQUIRED_ENV = ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD")
 
 FACT_COLUMNS = (
@@ -75,7 +98,18 @@ FACT_COLUMNS = (
     "home_final", "away_final",
 )
 
-STAT_KEYS = ("rows", "loaded", "quarantined", "filtered", "resolved", "corrected")
+ABNORMAL_COLUMNS = (
+    "match_id", "match_date", "match_time", "country",
+    "league_id", "league", "season",
+    "home_team_id", "away_team_id", "home_team", "away_team",
+    "home_final", "away_final",
+    "reason", "raw_record", "source_file",
+)
+
+STAT_KEYS = (
+    "rows", "loaded", "quarantined", "filtered", "resolved",
+    "corrected", "club_corrected", "abnormal", "removed",
+)
 
 columns_sql = ", ".join(FACT_COLUMNS)
 values_sql = ", ".join(f"%({column})s" for column in FACT_COLUMNS)
@@ -89,6 +123,25 @@ VALUES ({values_sql})
 ON CONFLICT (match_id) DO UPDATE SET
     {updates_sql},
     loaded_at = now()
+"""
+
+abnormal_columns_sql = ", ".join(ABNORMAL_COLUMNS)
+abnormal_values_sql = ", ".join(f"%({column})s" for column in ABNORMAL_COLUMNS)
+abnormal_updates_sql = ",\n    ".join(
+    f"{column} = EXCLUDED.{column}" for column in ABNORMAL_COLUMNS if column != "match_id"
+)
+
+UPSERT_ABNORMAL_SQL = f"""
+INSERT INTO basketball.abnormal_results ({abnormal_columns_sql})
+VALUES ({abnormal_values_sql})
+ON CONFLICT (match_id) DO UPDATE SET
+    {abnormal_updates_sql},
+    loaded_at = now()
+"""
+
+DELETE_FROM_FACT_SQL = """
+DELETE FROM basketball.fact_games
+WHERE match_id = %s
 """
 
 QUARANTINE_SQL = """
@@ -117,6 +170,11 @@ FROM basketball.half_style_leagues
 CORRECTIONS_SQL = """
 SELECT match_id, league_id, league, country
 FROM basketball.league_corrections
+"""
+
+CLUB_CORRECTIONS_SQL = """
+SELECT match_id, side, api_team_id, club_id
+FROM basketball.club_corrections
 """
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -202,6 +260,29 @@ class ClubResolver:
         return club_id
 
 
+def club_of(side, team, league_id, resolver, club_fixes):
+    """
+    The club_id for one side of one game.
+
+    If club_corrections has a row for this game and side, that row decides,
+    but only when the team on that side has the api_team_id the row expects.
+    A mismatch means the row was typed for the wrong side, so the game is
+    quarantined rather than given a wrong club. With no correction, the
+    normal lookup in club_id_overrides decides.
+    """
+    fix = club_fixes.get(side)
+    if fix is None:
+        return resolver.resolve(team.id, league_id)
+
+    expected_api_team_id, club_id = fix
+    if team.id != expected_api_team_id:
+        raise QuarantineError(
+            f"club correction mismatch: {side} team id is {team.id}, "
+            f"club_corrections expects {expected_api_team_id}"
+        )
+    return club_id
+
+
 # ---------------------------------------------------------------------------
 # Transform
 # ---------------------------------------------------------------------------
@@ -255,8 +336,60 @@ def league_of(match, correction):
     return match.league.id, match.league.name, country
 
 
-def build_row(match, resolver, half_style_ids, correction=None):
+def kickoff_utc(match):
+    """The kickoff time in UTC. A time with no timezone is taken as UTC."""
+    kickoff = match.date
+    if kickoff.tzinfo is None:
+        kickoff = kickoff.replace(tzinfo=timezone.utc)
+    return kickoff.astimezone(timezone.utc)
+
+
+def abnormal_reason(match):
+    """
+    The reason a finished game is not a normal played result, or None if it
+    looks normal. Today there is one rule: either team has a final score of
+    0, and the API sent no quarter scores and no overtime score. A team
+    cannot score 0 in a played game, and a game with quarter scores or
+    overtime is a played game, so it takes the normal path instead.
+    """
+    score = match.state.score
+    if score.overTime is not None:
+        return None
+    if any(getattr(score, q) is not None for q in QUARTERS):
+        return None
+    home_final, away_final = parse_score("current", score.current)
+    if home_final == 0 or away_final == 0:
+        return ZERO_SCORE_REASON
+    return None
+
+
+def abnormal_row(match, reason, correction=None):
+    """Turn one abnormal game into one abnormal_results row (no club lookup)."""
+    league_id, league_name, country = league_of(match, correction)
+    home_final, away_final = parse_score("current", match.state.score.current)
+    kickoff = kickoff_utc(match)
+
+    return {
+        "match_id": match.id,
+        "match_date": kickoff.date(),
+        "match_time": kickoff.time(),
+        "country": country,
+        "league_id": league_id,
+        "league": league_name,
+        "season": match.league.season,
+        "home_team_id": match.homeTeam.id,
+        "away_team_id": match.awayTeam.id,
+        "home_team": match.homeTeam.name,
+        "away_team": match.awayTeam.name,
+        "home_final": home_final,
+        "away_final": away_final,
+        "reason": reason,
+    }
+
+
+def build_row(match, resolver, half_style_ids, correction=None, club_fixes=None):
     """Turn one validated finished match into one fact_games row."""
+    club_fixes = club_fixes or {}
     league_id, league_name, country = league_of(match, correction)
     score = match.state.score
 
@@ -306,13 +439,10 @@ def build_row(match, resolver, half_style_ids, correction=None):
     if match.homeTeam.id == match.awayTeam.id:
         raise QuarantineError("home and away team ids are the same")
 
-    home_club_id = resolver.resolve(match.homeTeam.id, league_id)
-    away_club_id = resolver.resolve(match.awayTeam.id, league_id)
+    home_club_id = club_of("home", match.homeTeam, league_id, resolver, club_fixes)
+    away_club_id = club_of("away", match.awayTeam, league_id, resolver, club_fixes)
 
-    kickoff = match.date
-    if kickoff.tzinfo is None:
-        kickoff = kickoff.replace(tzinfo=timezone.utc)
-    kickoff = kickoff.astimezone(timezone.utc)
+    kickoff = kickoff_utc(match)
 
     return {
         "match_id": match.id,
@@ -351,11 +481,16 @@ def build_row(match, resolver, half_style_ids, correction=None):
 # ---------------------------------------------------------------------------
 # Load
 # ---------------------------------------------------------------------------
-def process_file(conn, path, resolver, half_style_ids, corrections, seen_corrections):
+def process_file(
+    conn, path, resolver, half_style_ids,
+    corrections, club_corrections, seen_corrections, seen_club_corrections,
+):
     """
     Load one raw day file in one transaction. Returns row counts.
     Every match id in the file that has a league correction is added to
-    seen_corrections, so main() can report corrections that matched nothing.
+    seen_corrections, and every one with a club correction to
+    seen_club_corrections, so main() can report corrections that matched
+    nothing.
     """
     payload = json.loads(path.read_text(encoding="utf-8"))
     matches = payload.get("matches")
@@ -379,13 +514,22 @@ def process_file(conn, path, resolver, half_style_ids, corrections, seen_correct
             if correction is not None:
                 seen_corrections.add(raw.get("id"))
 
+            club_fixes = club_corrections.get(raw.get("id"))
+            if club_fixes is not None:
+                seen_club_corrections.add(raw.get("id"))
+
             state = (raw.get("state") or {}).get("description")
             if state not in FINISHED_STATES:
                 stats["filtered"] += 1
                 continue
 
             try:
-                row = build_row(Match.model_validate(raw), resolver, half_style_ids, correction)
+                match = Match.model_validate(raw)
+                reason_abnormal = abnormal_reason(match)
+                if reason_abnormal is not None:
+                    row = abnormal_row(match, reason_abnormal, correction)
+                else:
+                    row = build_row(match, resolver, half_style_ids, correction, club_fixes)
             except ValidationError as err:
                 first = err.errors()[0]
                 field = ".".join(str(part) for part in first["loc"])
@@ -393,17 +537,29 @@ def process_file(conn, path, resolver, half_style_ids, corrections, seen_correct
             except QuarantineError as err:
                 reason = str(err)
             else:
-                cur.execute(UPSERT_SQL, row)
-                stats["loaded"] += 1
-                if correction is not None:
-                    stats["corrected"] += 1
+                if reason_abnormal is not None:
+                    row["raw_record"] = Jsonb(raw)
+                    row["source_file"] = path.name
+                    cur.execute(UPSERT_ABNORMAL_SQL, row)
+                    stats["abnormal"] += 1
 
-                cur.execute(RESOLVE_QUARANTINE_SQL, (row["match_id"],))
+                    # An earlier run may have loaded it as a normal game.
+                    cur.execute(DELETE_FROM_FACT_SQL, (match.id,))
+                    stats["removed"] += cur.rowcount
+                else:
+                    cur.execute(UPSERT_SQL, row)
+                    stats["loaded"] += 1
+                    if correction is not None:
+                        stats["corrected"] += 1
+                    if club_fixes is not None:
+                        stats["club_corrected"] += 1
+
+                cur.execute(RESOLVE_QUARANTINE_SQL, (match.id,))
                 if cur.rowcount:
                     stats["resolved"] += cur.rowcount
                     log.info(
                         "%s: match %s now loads cleanly - %d quarantine row(s) marked fixed",
-                        path.name, row["match_id"], cur.rowcount,
+                        path.name, match.id, cur.rowcount,
                     )
                 continue
 
@@ -411,7 +567,7 @@ def process_file(conn, path, resolver, half_style_ids, corrections, seen_correct
             stats["quarantined"] += 1
             log.warning("%s: match %s quarantined: %s", path.name, raw.get("id"), reason)
 
-    accounted = stats["loaded"] + stats["quarantined"] + stats["filtered"]
+    accounted = stats["loaded"] + stats["abnormal"] + stats["quarantined"] + stats["filtered"]
     if accounted != stats["rows"]:
         raise RuntimeError(f"{path.name}: {accounted} rows accounted for, file has {stats['rows']}")
 
@@ -460,7 +616,7 @@ def files_to_load(args):
 
 
 def read_lookups(conn):
-    """Read the three lookup tables once, before any file is loaded."""
+    """Read the four lookup tables once, before any file is loaded."""
     with conn.cursor() as cur:
         cur.execute(OVERRIDES_SQL)
         resolver = ClubResolver(cur.fetchall())
@@ -471,13 +627,18 @@ def read_lookups(conn):
             match_id: (league_id, league, country)
             for match_id, league_id, league, country in cur.fetchall()
         }
+        cur.execute(CLUB_CORRECTIONS_SQL)
+        club_corrections = {}
+        for match_id, side, api_team_id, club_id in cur.fetchall():
+            club_corrections.setdefault(match_id, {})[side] = (api_team_id, club_id)
 
     log.info(
         "club_id_overrides: %d rows, %d shared api ids; half_style_leagues: %d leagues; "
-        "league_corrections: %d rows",
-        len(resolver.overrides), len(resolver.shared_ids), len(half_style_ids), len(corrections),
+        "league_corrections: %d rows; club_corrections: %d games",
+        len(resolver.overrides), len(resolver.shared_ids), len(half_style_ids),
+        len(corrections), len(club_corrections),
     )
-    return resolver, half_style_ids, corrections
+    return resolver, half_style_ids, corrections, club_corrections
 
 
 def main():
@@ -489,14 +650,16 @@ def main():
     totals = dict.fromkeys(STAT_KEYS, 0)
     failed = []
     seen_corrections = set()
+    seen_club_corrections = set()
 
     with psycopg.connect(**settings, autocommit=True) as conn:
-        resolver, half_style_ids, corrections = read_lookups(conn)
+        resolver, half_style_ids, corrections, club_corrections = read_lookups(conn)
 
         for path in files:
             try:
                 stats = process_file(
-                    conn, path, resolver, half_style_ids, corrections, seen_corrections
+                    conn, path, resolver, half_style_ids,
+                    corrections, club_corrections, seen_corrections, seen_club_corrections,
                 )
             except Exception:
                 log.exception("%s: failed - nothing from this file was loaded", path.name)
@@ -504,19 +667,22 @@ def main():
                 continue
 
             log.info(
-                "%s: %d rows -> %d loaded, %d quarantined, %d not finished, "
-                "%d league corrections",
-                path.name, stats["rows"], stats["loaded"], stats["quarantined"],
-                stats["filtered"], stats["corrected"],
+                "%s: %d rows -> %d loaded, %d abnormal, %d quarantined, %d not finished, "
+                "%d league corrections, %d club corrections",
+                path.name, stats["rows"], stats["loaded"], stats["abnormal"],
+                stats["quarantined"], stats["filtered"], stats["corrected"],
+                stats["club_corrected"],
             )
             for key in totals:
                 totals[key] += stats[key]
 
     log.info(
-        "done: %d files, %d rows -> %d loaded, %d quarantined, %d not finished, "
-        "%d quarantine rows marked fixed, %d league corrections applied",
-        len(files) - len(failed), totals["rows"], totals["loaded"],
-        totals["quarantined"], totals["filtered"], totals["resolved"], totals["corrected"],
+        "done: %d files, %d rows -> %d loaded, %d abnormal (%d removed from fact_games), "
+        "%d quarantined, %d not finished, %d quarantine rows marked fixed, "
+        "%d league corrections applied, %d club corrections applied",
+        len(files) - len(failed), totals["rows"], totals["loaded"], totals["abnormal"],
+        totals["removed"], totals["quarantined"], totals["filtered"], totals["resolved"],
+        totals["corrected"], totals["club_corrected"],
     )
 
     # Only a full load sees every raw file, so only then can an unused
@@ -527,6 +693,12 @@ def main():
             log.warning(
                 "%d league corrections matched no game in raw/matches (mistyped match_id?): %s",
                 len(unused), ", ".join(str(match_id) for match_id in unused),
+            )
+        unused_club = sorted(set(club_corrections) - seen_club_corrections)
+        if unused_club:
+            log.warning(
+                "%d club corrections matched no game in raw/matches (mistyped match_id?): %s",
+                len(unused_club), ", ".join(str(match_id) for match_id in unused_club),
             )
 
     if failed:
