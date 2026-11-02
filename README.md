@@ -4,7 +4,7 @@ Pulls basketball games from the Highlightly API, stores every raw response,
 validates and cleans the games, and loads them into Postgres. The backend
 (a separate project) reads the clean table to compute picks. This repo is
 **only the data pipeline**: ingestion, raw storage, schema, validation,
-scheduling, checks. It does no statistics.
+scheduling, checks, alerts. It does no statistics.
 
 Last updated: 2026-10-29.
 
@@ -25,11 +25,14 @@ basketball.quarantine_games      games that failed validation, with the reason
       v
 run_checks.py                    sanity checks over the whole table
       |
+      +--> Slack #pipeline-alerts   green message (finished) / red message (failed)
+      +--> Healthchecks.io          daily heartbeat; alerts if it does NOT arrive
+      |
       v
 backend (outside this repo)      computes picks from fact_games
 ```
 
-Airflow runs the daily part (fetch, load, checks) at 06:00 UTC
+Airflow runs the daily part (fetch, load, checks, alerts) at 06:00 UTC
 (07:00 Lagos). Everything can also be run by hand from the terminal.
 
 **Two different Postgres databases exist. Do not mix them up:**
@@ -54,7 +57,9 @@ The Airflow containers reach the Windows database through
 | `backfill.py` | Fetches old days, newest first, resumable |
 | `load_games.py` | Raw files to `fact_games` / `quarantine_games` |
 | `run_checks.py` | Checks over the whole table; exit code 1 if a check fails |
-| `dags/basketball_daily.py` | The Airflow DAG |
+| `dags/basketball_daily.py` | The Airflow DAG (tasks, schedule, Slack messages) |
+| `dags/slack_alert.py` | Sends one message to Slack through the Incoming Webhook |
+| `dags/healthcheck_ping.py` | Sends the daily heartbeat ping to Healthchecks.io |
 | `sql/01_schema.sql` | Creates the schema, tables, indexes |
 | `sql/02_seed_lookups.sql` | Rows for the four lookup tables (keep in sync with production) |
 | `docker-compose.yml`, `Dockerfile`, `requirements-airflow.txt` | Airflow stack |
@@ -319,18 +324,25 @@ Not yet worked through. Same process as above.
 ## 7. The daily run (Airflow)
 
 DAG `basketball_daily`, schedule `0 6 * * *` (06:00 UTC, 07:00 Lagos),
-`catchup=True`, `max_active_runs=1`. Three tasks in order:
+`catchup=True`, `max_active_runs=1`. Tasks:
 
 | Task | What it runs | Retries |
 |---|---|---|
 | `fetch_daily` | `python fetch_daily.py <target date>` | 2, 10 min apart |
 | `load_games` | `python load_games.py <day before target>` then `<target>` | 0 |
 | `run_checks` | `python run_checks.py` | 0 |
+| `notify_success` | Posts the green Slack message (counts read from the database) | 2, 2 min apart |
+| `ping_healthcheck` | Pings Healthchecks.io | 2, 2 min apart |
 
-`fetch_daily >> load_games >> run_checks`. The target date is derived from
-`dag_run.run_after` minus one day, i.e. the day that just finished in UTC.
-If a run fails, later tasks do not run (they show `upstream_failed`). Look at
-the red task's log first.
+`fetch_daily >> load_games >> run_checks >> [notify_success, ping_healthcheck]`.
+The last two run in parallel, only after `run_checks` succeeded. The target
+date is derived from `dag_run.run_after` minus one day, i.e. the day that just
+finished in UTC. If a run fails, later tasks do not run (they show
+`upstream_failed`). Look at the red task's log first.
+
+`notify_success` and `ping_healthcheck` are `PythonOperator` tasks, so
+they need `psycopg` and the `dags/` helper files inside the container (both
+are already there).
 
 **Docker stack** (`docker-compose.yml`, image `basketball-airflow:3.3.2`):
 `api-server` (UI), `scheduler`, `dag-processor`, the `postgres` metadata
@@ -347,7 +359,7 @@ repeat). LocalExecutor.
 
 | You changed | Do this |
 |---|---|
-| A `.py` file (DAG or scripts) | Nothing. Code is mounted live |
+| A `.py` file (DAG, helpers or scripts) | Nothing. Code is mounted live |
 | `.env` or `docker-compose.yml` | `docker compose up -d --force-recreate` |
 | `Dockerfile` or `requirements-airflow.txt` | `docker compose build`, then `docker compose up -d` |
 
@@ -369,8 +381,7 @@ containers so they re-read `.env`; `build` rebuilds the image.)
 
 ### Re-running a failed run (Airflow UI)
 1. Open the failed run, select the failed task (`fetch_daily`).
-2. **Clear** it with **Downstream** ticked, so `load_games` and `run_checks`
-   run again too.
+2. **Clear** it with **Downstream** ticked, so the later tasks run again too.
 3. The tasks re-run on their own and the same run turns green.
 
 ### Triggering a brand-new run
@@ -380,9 +391,91 @@ run's logical date, so no tasks are created. This is expected, not a bug. Use
 **Clear** on an existing failed run (above), or the CLI from the project folder:
 `docker compose exec airflow-scheduler airflow dags trigger basketball_daily`.
 
+### Old runs show fewer tasks
+Airflow 3 remembers which version of the DAG each run used. Runs from before a
+task was added keep showing the old task list. That is normal.
+
+### Git Bash on Windows: container paths
+Git Bash rewrites arguments that start with `/` into Windows paths. For any
+`docker compose exec` command that contains a container path, put
+`MSYS_NO_PATHCONV=1` in front, for example:
+```
+MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler python /opt/airflow/dags/slack_alert.py "test message"
+```
+(Without it you get `can't open file '/opt/airflow/C:/Program Files/Git/...'`.)
+
+### If http://127.0.0.1:8080 does not open
+After a restart of the PC or Docker, port forwarding to the API server can get
+stuck: containers show `healthy`, but `curl -I http://127.0.0.1:8080` says
+"Empty reply from server". Restarting only the API server fixed it
+(2026-10-29): `docker compose restart airflow-apiserver`.
+
 ---
 
-## 8. Change detection
+## 8. Alerts: Slack and the heartbeat
+
+Two separate alarms, covering two different failures:
+
+| Situation | Who notices | How |
+|---|---|---|
+| The pipeline ran and a task failed | Airflow | Red message in Slack `#pipeline-alerts` |
+| The pipeline ran and finished | Airflow | Green message in Slack `#pipeline-alerts` |
+| The pipeline **did not run at all** (laptop asleep, Docker down) | Healthchecks.io (outside this machine) | Posts to Slack when the daily ping is missing |
+
+Airflow cannot report a run that never started, which is why the second alarm
+lives on a service outside the laptop.
+
+### Slack messages (from `dags/basketball_daily.py`)
+- **Red message:** sent by `on_failure_callback` on every task, only after a
+  task has failed **for good** (for `fetch_daily` that means after its two
+  retries). It shows the task, the number of attempts, the day, the error, a
+  link to the log and a hint of what to check first. Tasks that did not run
+  because an earlier one failed (`upstream_failed`) send nothing, so one root
+  cause gives one alert.
+- **The error line only holds the exit code.** The scripts run through
+  `BashOperator`, whose exception says "Bash command failed. The command
+  returned a non-zero exit code 1." The script's own message (for example an
+  HTTP 429) stays in the task log. Open the log link.
+- **Green message:** sent by `notify_success`. It shows the day, how many games
+  `fact_games` holds for that day, and the open quarantine count. If the day has
+  0 games it adds a warning line.
+- **No green message by about 08:00 Lagos time means the run needs a look.**
+- The log link uses `http://localhost:8080`, so it only opens on the laptop
+  where Airflow runs.
+- The Slack helper is `dags/slack_alert.py`. The webhook URL is read from
+  `SLACK_WEBHOOK_URL` and is never logged. If Slack cannot be reached,
+  the failure callback logs the problem and does not crash; `notify_success`
+  fails and retries, so an undelivered alert is never mistaken for success.
+
+Test the Slack helper by hand:
+```
+MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler python /opt/airflow/dags/slack_alert.py "test message"
+```
+
+### Healthchecks.io (the dead man's switch)
+- Check name `basketball_daily`, expected once a day on the cron schedule
+  `0 6 * * *` in UTC, with a grace time of 30 minutes. If no ping arrives by
+  then, Healthchecks.io posts to `#pipeline-alerts` through its own Slack
+  integration. (The values are set on the Healthchecks.io website; check them
+  there if this ever changes.)
+- `ping_healthcheck` sends the ping after `run_checks` succeeds. The helper is
+  `dags/healthcheck_ping.py`, and the URL is read from `HEALTHCHECK_PING_URL`.
+  **Treat the ping URL as a secret:** anyone who has it can send "all fine"
+  pings that hide a real outage.
+- A run that needs a fetch retry can finish close to the end of the grace
+  time. If it ever sends a false alarm, Healthchecks.io also reports when the
+  ping finally arrives; widen the grace time if it happens again.
+
+Test the ping by hand (also marks the check as received for today):
+```
+MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler python /opt/airflow/dags/healthcheck_ping.py
+```
+Test the Slack link from Healthchecks.io with the test-notification button of
+its Slack integration.
+
+---
+
+## 9. Change detection
 
 When `fetch_daily.py` re-fetches a day that already has a file, it compares
 the old and new file by `match_id` and writes
@@ -404,7 +497,7 @@ two-day window enough?
 
 ---
 
-## 9. Quota facts (Highlightly)
+## 10. Quota facts (Highlightly)
 
 - About 100 requests per day per key; resets at midnight UTC (1 AM Lagos).
 - Remaining quota comes from the `x-ratelimit-requests-remaining` header;
@@ -418,26 +511,30 @@ two-day window enough?
 
 ---
 
-## 10. Settings (`.env`)
+## 11. Settings (`.env`)
 
 Keys only. **Values are never written here or committed.**
 
 `HIGHLIGHTLY_API_KEY`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`,
 `DB_PASSWORD`, `BACKFILL_STOP_DATE`, `QUOTA_RESERVE`, `FERNET_KEY`,
 `AIRFLOW_JWT_SECRET`, `AIRFLOW_DB_PASSWORD`, `AIRFLOW_ADMIN_USERNAME`,
-`AIRFLOW_ADMIN_PASSWORD`, `AIRFLOW_UID`. A `SLACK_WEBHOOK_URL` will be
-added for alerts.
+`AIRFLOW_ADMIN_PASSWORD`, `AIRFLOW_UID`, `SLACK_WEBHOOK_URL`,
+`HEALTHCHECK_PING_URL`.
 
 - `.env`, `logs/`, `raw/`, `venv/` are in `.gitignore`. Check `git status`
   before every commit.
 - A value already in the environment wins over the same name loaded later by
   `python-dotenv`, so containers need recreating after a `.env` change.
+  Check a value reached a container without printing it:
+  `docker compose exec airflow-scheduler python -c "import os; print('set' if os.getenv('SLACK_WEBHOOK_URL') else 'missing')"`
+- `SLACK_WEBHOOK_URL` and `HEALTHCHECK_PING_URL` are secrets. Never paste them
+  in chat or commit them.
 - Before restricting access on any real database, confirm a recovery path
   that does not depend on that access.
 
 ---
 
-## 11. Typical sessions
+## 12. Typical sessions
 
 **Catch up on old days (terminal):**
 ```
@@ -446,21 +543,28 @@ python load_games.py      # load the new files
 python run_checks.py      # check the whole table
 ```
 
-**Check on a failed daily run:**
-1. Open the Airflow UI and find the red task.
+**Check on a failed daily run (a red Slack message arrived):**
+1. Open the log link from the message, or the Airflow UI, and find the red task.
 2. Read its log from the bottom up.
 3. Fetch failed: quota or network. Load failed: read the traceback.
    Checks failed: read the `ERROR` lines.
 4. Fix, then clear the failed task with Downstream ticked (section 7).
 
+**No green message and no red one by 08:00 Lagos:** check whether the laptop
+was on and Docker Desktop running at 06:00 UTC. If Healthchecks.io also posted
+that the ping is late, the run did not happen or did not finish.
+
 ---
 
-## 12. Known limitations and to-do
+## 13. Known limitations and to-do
 
-- Failure alerts to Slack are not set up yet. Plan: an Airflow connection and
-  an `on_failure_callback`, firing only after `fetch_daily`'s retries run out.
-- The backend run is not yet triggered by this pipeline (idea: a fourth task,
-  so it only runs when the pipeline succeeded).
+- The Slack error line holds only the exit code, not the script's own message
+  (section 8). Reading the last log line into the alert is possible later.
+- The log link in the alert only opens on the laptop running Airflow.
+- The red-path callback was tested by calling the function with a fake failure,
+  not by a real failing task. The first real failure is its real test.
+- The backend run is not yet triggered by this pipeline (idea: a further task
+  after `run_checks`, so it only runs when the pipeline succeeded).
 - 149 games are in open quarantine (70 ambiguous club; the rest are score
   problems, same-team ids and one missing overtime score). They are not lost,
   only waiting for review.
@@ -493,7 +597,7 @@ python run_checks.py      # check the whole table
 
 ---
 
-## 13. Conventions
+## 14. Conventions
 
 - No secrets in code or in Git.
 - Every script does one thing and exits non-zero on failure.
@@ -502,4 +606,3 @@ python run_checks.py      # check the whole table
 - Raw files are never edited. Fixes are lookup rows applied by the loader.
 - Reloading is always safe (upserts).
 - Use `TRUNCATE ... RESTART IDENTITY` (not `DELETE`) when clearing a table.
-- Commit messages end with the Co-Authored-By and Claude-Session trailers.
