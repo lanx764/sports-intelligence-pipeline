@@ -6,7 +6,7 @@ validates and cleans the games, and loads them into Postgres. The backend
 **only the data pipeline**: ingestion, raw storage, schema, validation,
 scheduling, checks, alerts. It does no statistics.
 
-Last updated: 2026-10-29.
+Last updated: 2026-11-02.
 
 ---
 
@@ -17,16 +17,17 @@ Highlightly API
       |  fetch_daily.py (daily) / backfill.py (old days)
       v
 raw/matches/YYYY-MM-DD.json      one file per UTC day, exactly what the API sent
-      |  load_games.py  (+ lookup tables: corrections, club overrides, half-style)
+      |  load_games.py
       v
-basketball.fact_games            clean, validated games (one row per match_id)
+basketball.fact_games            clean, validated, really-played games (one row per match_id)
 basketball.quarantine_games      games that failed validation, with the reason
+basketball.abnormal_results      finished games that are not normal results (a team scored 0)
       |
       v
 run_checks.py                    sanity checks over the whole table
       |
-      +--> Slack #pipeline-alerts   green message (finished) / red message (failed)
-      +--> Healthchecks.io          daily heartbeat; alerts if it does NOT arrive
+      v
+Slack message + Healthchecks.io ping
       |
       v
 backend (outside this repo)      computes picks from fact_games
@@ -39,7 +40,7 @@ Airflow runs the daily part (fetch, load, checks, alerts) at 06:00 UTC
 
 | Name | Where | What it holds |
 |---|---|---|
-| Basketball DB `sports_intelligence_db` | Windows Postgres (port 5432) | `fact_games`, `quarantine_games`, lookup tables |
+| Basketball DB `sports_intelligence_db` | Windows Postgres (port 5432) | `fact_games`, `quarantine_games`, `abnormal_results`, lookup tables |
 | Airflow metadata DB `airflow` | `postgres` container inside Docker | Airflow's own run history, users, state |
 
 The Airflow containers reach the Windows database through
@@ -55,17 +56,18 @@ The Airflow containers reach the Windows database through
 | `highlightly_client.py` | Shared code: API calls, quota tracking, raw file writing, change detection |
 | `fetch_daily.py` | Daily extract: one day plus the day before |
 | `backfill.py` | Fetches old days, newest first, resumable |
-| `load_games.py` | Raw files to `fact_games` / `quarantine_games` |
+| `load_games.py` | Raw files to `fact_games` / `quarantine_games` / `abnormal_results` |
 | `run_checks.py` | Checks over the whole table; exit code 1 if a check fails |
-| `dags/basketball_daily.py` | The Airflow DAG (tasks, schedule, Slack messages) |
-| `dags/slack_alert.py` | Sends one message to Slack through the Incoming Webhook |
-| `dags/healthcheck_ping.py` | Sends the daily heartbeat ping to Healthchecks.io |
+| `dags/basketball_daily.py` | The Airflow DAG |
+| `dags/slack_alert.py` | Sends a message to Slack (used by the alerts) |
+| `dags/healthcheck_ping.py` | Pings Healthchecks.io (the dead man's switch) |
 | `sql/01_schema.sql` | Creates the schema, tables, indexes |
-| `sql/02_seed_lookups.sql` | Rows for the four lookup tables (keep in sync with production) |
+| `sql/02_seed_lookups.sql` | Rows for the lookup tables (keep in sync with production) |
 | `docker-compose.yml`, `Dockerfile`, `requirements-airflow.txt` | Airflow stack |
+| `requirements.txt` | Python packages for running the scripts by hand |
 | `.env` | Settings and secrets. **Never committed.** |
 | `.env.example` | Placeholders only (committed) |
-| `raw/matches/` | Raw day files (not in Git). **Never edited by hand** |
+| `raw/matches/` | Raw day files (not in Git) |
 | `raw/changes/` | Change reports when a day is re-fetched (not in Git) |
 | `logs/` | Airflow logs (not in Git) |
 
@@ -83,7 +85,7 @@ Run all of these from the project folder with the venv active.
   (fewer matches than the API's total) is **not** saved, so it never
   replaces a good file.
 - Before replacing a file it compares old and new, game by game, and writes
-  a change report to `raw/changes/` (see section 8). Change detection never
+  a change report to `raw/changes/` (see section 9). Change detection never
   fails the run.
 - Exits 1 on any fetch/quota/incomplete failure, so Airflow marks the task failed.
 - `python fetch_daily.py` fetches yesterday and the day before.
@@ -95,32 +97,35 @@ Run all of these from the project folder with the venv active.
   each run continues where the last one stopped and also fills gaps.
 - Stops when the quota is down to `QUOTA_RESERVE`.
 - Run it in the terminal, **not** in Airflow. It is a one-off catch-up tool.
-- **It shares the API key with the daily DAG.** A backfill late at night
-  can use up the quota before the 07:00 run. Keep `QUOTA_RESERVE` high enough
-  to leave the daily run what it needs (section 9).
 
 ### load_games.py: raw to database
 - Keeps finished games only (`Finished`, `Finished after over time`).
   Everything else counts as "not finished" and is skipped.
-- Reads three lookup tables once at startup: `league_corrections`,
-  `club_id_overrides`, `half_style_leagues`.
-- For a game listed in `league_corrections`, the true league and country
-  replace what the API sent **before any rule runs**, so every later rule
-  (half-style check, club lookup) sees the true league.
-- Validates each game (section 5). Clean games are upserted into
-  `fact_games` (`ON CONFLICT (match_id) DO UPDATE`). Bad games go to
-  `quarantine_games` with a reason.
+- Reads four lookup tables first (section 4): `club_id_overrides`,
+  `club_corrections`, `league_corrections`, `half_style_leagues`.
+- For each finished game, in this order:
+  1. **League correction:** if the match is in `league_corrections`, the
+     true league replaces what the API sent.
+  2. **Abnormal result:** if either team has a final score of 0, with no
+     quarter scores and no overtime score, the game was not really played
+     (walkover, forfeit, abandoned). It is written to `abnormal_results` and
+     removed from `fact_games` if an earlier run put it there. It skips the
+     club lookup.
+  3. **Validation** (section 5). Clean games are upserted into `fact_games`
+     (`ON CONFLICT (match_id) DO UPDATE`). Bad games go to
+     `quarantine_games` with a reason.
+  4. **Club ids:** `club_corrections` first (one side of one game), then
+     `club_id_overrides` (API id plus league), otherwise `club_id` = API id.
 - One transaction per file. Safe to re-run.
 - If a quarantined game later loads cleanly, its open quarantine rows are
   marked `fixed`.
-- After a full load it warns about any league correction whose `match_id`
-  matched no game in `raw/matches` (most likely a mistyped id).
-- `python load_games.py` loads every file (about 3.5 minutes for 1,298 files).
+- Prints a `done:` line with the totals: loaded, abnormal (and how many were
+  removed from `fact_games`), quarantined, not finished, quarantine rows
+  marked fixed, league corrections applied, club corrections applied.
+- After a full load it warns about any league or club correction whose
+  `match_id` matched no game in `raw/matches` (most likely a mistyped id).
+- `python load_games.py` loads every file.
 - `python load_games.py 2026-10-23` loads one day.
-- Short view of the result:
-  `python load_games.py 2>&1 | tail -n 5`
-  (on Git Bash, add `grep -a` when filtering, because some names contain
-  non-ASCII letters like š and plain `grep` would say "Binary file matches").
 
 ### run_checks.py: checks over the whole table
 1. **Shared team ids:** the same API team id appearing under different
@@ -128,16 +133,11 @@ Run all of these from the project folder with the venv active.
 2. **Period sums:** quarters/halves must add up to the totals.
 3. **Open quarantine:** warns about each open quarantine row (a warning,
    not a failure).
-- Exit 1 if check 1 or 2 fails. Takes about 80 seconds on the full table.
-- Short view of the result:
-  `python run_checks.py 2>&1 | grep -a -E "ERROR|checks done|PASSED|FAILED"`
+- Exit 1 if check 1 or 2 fails.
+- The last line is `PASSED` or `FAILED: fix the problems above`.
 - **Read the numbers, not just PASSED.** A shared id whose games are
   sitting in quarantine does not fail check 1. It only shows up in the
   quarantine count.
-- `load_games.py` is the gatekeeper for one game at a time and only knows the
-  ids listed in the lookup tables. `run_checks.py` audits the whole table and
-  is how **new** problems are discovered. Treat `run_checks.py` as the main
-  source of truth.
 
 ---
 
@@ -145,12 +145,14 @@ Run all of these from the project folder with the venv active.
 
 | Table | Purpose |
 |---|---|
-| `fact_games` | One row per finished, valid game. Primary key `match_id`. Has `home_club_id` / `away_club_id` (see below), quarter and half scores, totals, finals |
+| `fact_games` | One row per finished, valid, really-played game. Primary key `match_id`. Has `home_club_id` / `away_club_id` (see below), quarter and half scores, totals, finals |
 | `quarantine_games` | One row per (game, reason). `status`: `open`, `fixed` or `ignored`. Unique on `(match_id, reason)` |
+| `abnormal_results` | Finished games that are not normal played results. Has a `reason` column (the rule that caught the game), the raw record and the source file. No club columns |
 | `club_id_overrides` | `(api_team_id, league_id)` to our own `club_id` |
+| `club_corrections` | `(match_id, side)` to `club_id`, with the `api_team_id` expected on that side. For an API id used by two clubs inside the same league |
+| `league_corrections` | `match_id` to the true league, for games the API filed under the wrong league |
 | `half_style_leagues` | Leagues that report two halves, not four quarters |
 | `international_leagues` | Leagues with invited clubs from other countries |
-| `league_corrections` | Games the API filed under the wrong league: `match_id` to the true league |
 
 **Quarter columns are null for half-style leagues. `*_total` columns are
 regulation time only (overtime subtracted); `*_final` include overtime.**
@@ -160,25 +162,20 @@ The API's team id is not always unique to one club. The same id can belong
 to two different clubs in different countries (for example Atenas in
 Argentina and Uruguay). `club_id` is the id we trust:
 - normally `club_id` = the API team id
-- if `(api_team_id, league_id)` is in `club_id_overrides`, `club_id` = the
-  override. Override ids start at `9000001` so they can never collide with
-  an API id.
+- if the game has a row in `club_corrections` for that side, `club_id` =
+  that row. It also stores the `api_team_id` it expects; if the game has a
+  different team on that side, the game is quarantined
+  (`club correction mismatch`).
+- otherwise, if `(api_team_id, league_id)` is in `club_id_overrides`,
+  `club_id` = the override.
+- Override ids start at `9000001` so they can never collide with an API id.
 
-### league_corrections: why it exists
-Sometimes the API files a game under the wrong league. Example: 23 UK WBBL
-games were filed under Spain "Liga Femenina Women" (80778). Editing
-`fact_games` by hand does not last, because the next reload overwrites it from
-the raw file. Editing the raw file breaks the rule that raw is never changed.
-So the fix is a lookup table the loader applies every time.
-
-| Column | Meaning |
-|---|---|
-| `match_id` | The API match id (primary key) |
-| `league_id` | The true league id |
-| `league` | The true league name |
-| `country` | The true country |
-| `reason` | Why we believe the API is wrong (how it was verified) |
-| `created_at` | When the row was added |
+**A `club_id` must belong to exactly one real club.** The same club in
+several leagues reuses its `club_id`; two different clubs must never share
+one. Before inventing a new id, check the highest id in **both**
+`club_id_overrides` and `club_corrections` (last used: `9000038`). On
+2026-11-02 nine ids (`9000011` to `9000019`) were found shared by two clubs
+each and were fixed (section 6).
 
 ---
 
@@ -189,42 +186,40 @@ A finished game is quarantined (not dropped) when:
 | Reason text | Meaning |
 |---|---|
 | `ambiguous club: api team id X in league Y has no row in club_id_overrides` | X is a shared id and league Y has no override row (see section 6) |
-| `home and away team ids are the same` | Both sides carry one team id (usually a generic or mislabelled team) |
+| `club correction mismatch: <side> team id is A, club_corrections expects B` | A `club_corrections` row was typed for the wrong side |
 | `half-style league game: q1 and q2 should hold exactly one score` | A half-style league sent quarter-style data |
 | `final score (current) missing` | The API has no final score |
-| `finished after over time but overTime score missing` | Marked overtime, but no overtime score |
-| `overtime score is larger than final score` | Impossible overtime value |
-| `zero quarter: qN is 0 - 0` | A quarter shows 0 - 0 |
+| `zero quarter: qN is 0 - 0` | A quarter shows 0 - 0 (the points are suspect) |
 | `home/away quarters sum to A, final minus overtime is B` | Quarter scores incomplete or wrong |
-| `unparseable <period> score` | A score is not in the `105 - 104` shape |
+| `finished after over time but overTime score missing` | Overtime game with no overtime score |
+| `home and away team ids are the same` | The API gave both sides the same team |
 | `schema: <field>: ...` | A field is missing or the wrong type |
+
+**Not quarantined, but set aside:** a finished game where either team has a
+final score of 0, with no quarter scores and no overtime score, goes to
+`abnormal_results` (reason `team scored 0, no quarter scores, no overtime`).
+A team cannot score 0 in a played game; these are walkovers, forfeits or
+abandoned games. The API usually records 20 - 0 or 0 - 20. About 300 games
+fit this rule, spread over about 90 leagues.
 
 Quarantine rows are kept with the full raw record, so nothing is lost. Check
 them with:
 
 ```sql
-SELECT reason, COUNT(*) AS games
+SELECT left(reason, 70) AS reason_start, COUNT(*) AS games
 FROM basketball.quarantine_games
 WHERE status = 'open'
-GROUP BY reason
+GROUP BY left(reason, 70)
 ORDER BY games DESC;
 ```
-(`WHERE status = 'open'` keeps unresolved rows; `GROUP BY reason` + `COUNT(*)`
+(`WHERE status = 'open'` keeps unresolved rows; `left(reason, 70)` takes the
+first 70 characters so similar reasons group together; `GROUP BY` + `COUNT(*)`
 count games per reason; `ORDER BY games DESC` puts the biggest first.)
 
-`fixed` rows are kept on purpose: they are the history of what was wrong.
-`run_checks.py` counts only `open` rows.
-
-**Known limitations:**
-- A stricter rule does not remove games already loaded.
-  To rebuild from scratch: `TRUNCATE TABLE basketball.fact_games RESTART IDENTITY;`
-  then `python load_games.py`.
-- Quarantine inserts use `ON CONFLICT (match_id, reason) DO NOTHING`. If a
-  game was marked `fixed` and later fails for the **same** reason again, the
-  row stays `fixed` and hidden. Planned fix: reopen `fixed` rows (not
-  `ignored` ones) when the same reason returns.
-- Do not hand-`UPDATE` `fact_games`. A reload overwrites it from raw. Durable
-  fixes are lookup-table rows applied by the loader.
+**Known limitation:** a stricter rule does not remove games already loaded
+into `fact_games`, except for the abnormal-result rule, which does move them.
+To rebuild from scratch: `TRUNCATE TABLE basketball.fact_games RESTART IDENTITY;`
+then `python load_games.py`.
 
 ---
 
@@ -259,90 +254,93 @@ Steps:
    (`UNION ALL` stacks home and away appearances; `WHERE team_id IN` keeps
    the flagged ids; `GROUP BY` + `COUNT(*)` counts games per league.)
 2. **Look at the odd games** (the league with only a few games): opponent,
-   date, score. Confirm against a real source (a club or league website, ESPN).
-   Do not decide from the team name alone. On 2026-10-26 "York",
+   date, score. Confirm against a real source (a club or league website, ESPN,
+   FIBA). Do not decide from the team name alone, and do not trust a pasted
+   "verification" from another AI without a source. On 2026-10-26 "York",
    "Concordia" and "USC Heidelberg" turned out to be US colleges that
    share ids with a Canadian and a German club.
 3. **Decide which case it is:**
-   - **Two different clubs share one id** -> add override rows
-     (`club_id_overrides`), one per league, for **both** clubs. Give each
-     club one new `club_id` (next free number above `9000000`), reused
-     across that club's leagues.
+   - **Two different clubs share one id, in different leagues** -> add
+     override rows (`club_id_overrides`), one per league, for **both** clubs.
+     Give each club one `club_id` (see the rule in section 4), reused across
+     that club's leagues.
+   - **Two different clubs share one id inside the SAME league** (the
+     override key cannot split them) -> add one `club_corrections` row per
+     game and side. Example: API id 888377 in WASL (league 331823) is Al
+     Ittihad Aleppo (Syria) in the 2023-24 West Asia League and Ittihad Club
+     of Jeddah (Saudi Arabia) from 2024-25; 23 games were corrected one by
+     one. New 888377 games in WASL stay in quarantine until someone checks
+     them, on purpose.
    - **One club visiting a league abroad** (for example a Kazakh club in a
      Russian-hosted league) -> add the league to `international_leagues`.
      Cost: the check stops watching that whole league for shared ids.
-   - **The API filed a few games under the wrong league** (a club shows up
-     in a league of another country, a handful of games, dates that fit its
-     real league) -> this is **not** a shared id. Research the true league
-     and country of each game and add one row per game to
-     `league_corrections`. Do **not** add the league to
-     `international_leagues`: both leagues are real, and that would stop
-     watching the whole league.
-4. **Insert the rows** in pgAdmin, then **add the same statement to
+4. **Check `club_id` is not already taken.** Before inserting, run in pgAdmin:
+   ```sql
+   SELECT club_id, COUNT(DISTINCT club_name) AS names,
+          string_agg(DISTINCT club_name, ' | ') AS clubs
+   FROM basketball.club_id_overrides
+   GROUP BY club_id
+   HAVING COUNT(DISTINCT club_name) > 1
+   ORDER BY club_id;
+   ```
+   (`COUNT(DISTINCT club_name)` counts different names per id; `string_agg`
+   joins them into one text; `HAVING ... > 1` keeps only ids with more than
+   one name. It must return **no rows**.)
+5. **Insert the rows** in pgAdmin, then **add the same statement to
    `sql/02_seed_lookups.sql`** and commit it, so a rebuilt database matches
    production.
-5. **Reload and check:** `python load_games.py`, then `python run_checks.py`.
-   The reload corrects the club ids and leagues by upsert and marks the
-   quarantine rows `fixed` (look for `marked fixed` in the final `done:` line).
-6. If new leagues show up later with the same ambiguous reason (more backfill
-   days), repeat from step 4 with the new league ids.
+6. **Reload and check:** `python load_games.py`, then `python run_checks.py`.
+   The reload corrects the club ids by upsert and marks the quarantine rows
+   `fixed` (look for `marked fixed` in the final `done:` line).
+7. If new leagues show up later with the same ambiguous reason (more backfill
+   days), repeat from step 5 with the new league ids.
 
 Override row template (one row per league per club):
 ```sql
 INSERT INTO basketball.club_id_overrides
     (api_team_id, league_id, club_id, club_name, note)
 VALUES
-    (321611, 8443,  9000011, 'Laval (France)', 'Coupe de France'),
-    (321611, 25463, 9000016, 'Laval (Canada)', 'U SPORTS')
+    (321611, 8443,  9000029, 'Laval (France)', 'Coupe de France'),
+    (321611, 25463, 9000034, 'Laval (Canada)', 'U SPORTS')
 ON CONFLICT (api_team_id, league_id) DO NOTHING;
 ```
 (`ON CONFLICT ... DO NOTHING` skips existing keys, so re-running does nothing.)
 
-League correction template (one row per game):
+Correction row template (one row per game and side):
 ```sql
-INSERT INTO basketball.league_corrections
-    (match_id, league_id, league, country, reason)
+INSERT INTO basketball.club_corrections
+    (match_id, side, api_team_id, club_id, club_name, note)
 VALUES
-    (123456789, 93543, 'WBBL Women', 'United Kingdom',
-     'API filed this game under Spain Liga Femenina Women (80778); true league confirmed by manual research')
-ON CONFLICT (match_id) DO NOTHING;
+    (315122680, 'home', 888377, 9000038, 'Al Ittihad Aleppo (Syria)', 'WASL 2023-24; source and opponent')
+ON CONFLICT (match_id, side) DO NOTHING;
 ```
-(`match_id` is the API id of the one game; `league_id`, `league`, `country`
-are the **true** values; `reason` records how it was verified;
-`ON CONFLICT ... DO NOTHING` makes a re-run harmless.)
-
-**Open items (ambiguous-club games still in quarantine, 70 of them):**
-- ids 888377 and 816893 in WASL (league 331823)
-- id 109712 in leagues 307144, 306293, 335227, 307995
-- id 352247 in league 26314
-- id 610951 in league 165878
-
-Not yet worked through. Same process as above.
+(`side` is `home` or `away`; `api_team_id` is the id the loader expects on
+that side, and a mismatch quarantines the game instead of giving it the
+wrong club.)
 
 ---
 
 ## 7. The daily run (Airflow)
 
 DAG `basketball_daily`, schedule `0 6 * * *` (06:00 UTC, 07:00 Lagos),
-`catchup=True`, `max_active_runs=1`. Tasks:
+`catchup=True`, `max_active_runs=1`, start date 2026-10-26. Five tasks:
 
-| Task | What it runs | Retries |
+| Task | What it does | Retries |
 |---|---|---|
 | `fetch_daily` | `python fetch_daily.py <target date>` | 2, 10 min apart |
 | `load_games` | `python load_games.py <day before target>` then `<target>` | 0 |
 | `run_checks` | `python run_checks.py` | 0 |
-| `notify_success` | Posts the green Slack message (counts read from the database) | 2, 2 min apart |
-| `ping_healthcheck` | Pings Healthchecks.io | 2, 2 min apart |
+| `notify_success` | Posts the green Slack message with the day's counts | 2, 2 min apart |
+| `ping_healthcheck` | Pings Healthchecks.io (dead man's switch) | 2, 2 min apart |
 
 `fetch_daily >> load_games >> run_checks >> [notify_success, ping_healthcheck]`.
-The last two run in parallel, only after `run_checks` succeeded. The target
-date is derived from `dag_run.run_after` minus one day, i.e. the day that just
-finished in UTC. If a run fails, later tasks do not run (they show
-`upstream_failed`). Look at the red task's log first.
+The target date is derived from `dag_run.run_after` minus one day, i.e. the
+day that just finished in UTC. If a task fails, later tasks do not run.
+Look at the red task's log first.
 
-`notify_success` and `ping_healthcheck` are `PythonOperator` tasks, so
-they need `psycopg` and the `dags/` helper files inside the container (both
-are already there).
+**Task states:** a task that fails and will retry shows `up_for_retry`
+(orange). After the last retry it shows `failed` (red) and the later tasks
+show `upstream_failed`. Only the final failure sends the red Slack message.
 
 **Docker stack** (`docker-compose.yml`, image `basketball-airflow:3.3.2`):
 `api-server` (UI), `scheduler`, `dag-processor`, the `postgres` metadata
@@ -351,127 +349,72 @@ repeat). LocalExecutor.
 
 - UI: http://127.0.0.1:8080 (user and password in `.env`)
 - The PC must be on with Docker Desktop running at 06:00 UTC. A missed run
-  is caught up later (`catchup=True`): when the laptop comes back, Airflow
-  runs the missed 07:00 run. A sleeping laptop is the weakest link until the
-  pipeline moves to an always-on Linux server.
+  is caught up later (`catchup=True`).
+
+**If http://127.0.0.1:8080 does not open:** check `docker compose ps` (all
+containers should be healthy), then restart only the UI container:
+`docker compose restart airflow-apiserver`. This fixed a stuck port
+forwarding on 2026-10-29; the root cause was not proven.
 
 **When do I need to rebuild or recreate?**
 
 | You changed | Do this |
 |---|---|
-| A `.py` file (DAG, helpers or scripts) | Nothing. Code is mounted live |
+| A `.py` file (DAG or scripts) | Nothing. Code is mounted live |
 | `.env` or `docker-compose.yml` | `docker compose up -d --force-recreate` |
 | `Dockerfile` or `requirements-airflow.txt` | `docker compose build`, then `docker compose up -d` |
 
 (`up -d` starts the stack in the background; `--force-recreate` rebuilds the
 containers so they re-read `.env`; `build` rebuilds the image.)
 
-### Task states and retries
+**Git Bash on Windows:** it rewrites arguments that start with `/` into
+Windows paths. Put `MSYS_NO_PATHCONV=1` in front of any `docker compose exec`
+command that contains a container path, for example:
+`MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler python /opt/airflow/dags/slack_alert.py`
+(adjust the path if your mount differs).
 
-| State | Meaning | What to do |
-|---|---|---|
-| `up_for_retry` | An attempt failed and retries are left | Nothing. Airflow retries by itself after the delay |
-| `failed` | All attempts used up | Read the log, fix the cause, then clear the task |
-| `upstream_failed` | A task before it failed | Nothing. It runs again after the failed task is cleared with downstream |
-
-- **Retries fix temporary problems** (network down, DNS error like
-  `socket.gaierror -2`). **They do not fix an exhausted API quota**, which only
-  resets at midnight UTC. If the key is exhausted, put a new key in `.env`,
-  run `docker compose up -d --force-recreate`, then clear the failed task.
-
-### Re-running a failed run (Airflow UI)
-1. Open the failed run, select the failed task (`fetch_daily`).
-2. **Clear** it with **Downstream** ticked, so the later tasks run again too.
-3. The tasks re-run on their own and the same run turns green.
-
-### Triggering a brand-new run
-The UI **Trigger** button can finish in about 0.2 s with no task instances.
-Cause: the DAG's `start_date` (2026-10-26 06:00 UTC) is later than the manual
-run's logical date, so no tasks are created. This is expected, not a bug. Use
-**Clear** on an existing failed run (above), or the CLI from the project folder:
+**Triggering manually:** a run started from the UI "Trigger" button can
+finish in about 0.2 s with no task instances. Cause: the DAG's `start_date`
+is later than the manual run's logical date, so no tasks are created. Use
+**Clear with Downstream** on a real scheduled run instead, or the CLI:
 `docker compose exec airflow-scheduler airflow dags trigger basketball_daily`.
 
-### Old runs show fewer tasks
-Airflow 3 remembers which version of the DAG each run used. Runs from before a
-task was added keep showing the old task list. That is normal.
-
-### Git Bash on Windows: container paths
-Git Bash rewrites arguments that start with `/` into Windows paths. For any
-`docker compose exec` command that contains a container path, put
-`MSYS_NO_PATHCONV=1` in front, for example:
-```
-MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler python /opt/airflow/dags/slack_alert.py "test message"
-```
-(Without it you get `can't open file '/opt/airflow/C:/Program Files/Git/...'`.)
-
-### If http://127.0.0.1:8080 does not open
-After a restart of the PC or Docker, port forwarding to the API server can get
-stuck: containers show `healthy`, but `curl -I http://127.0.0.1:8080` says
-"Empty reply from server". Restarting only the API server fixed it
-(2026-10-29): `docker compose restart airflow-apiserver`.
+**Airflow 3 note:** old runs keep the task list of the DAG version they ran
+with. Tasks inside a DAG (such as `notify_success`) are not separate DAGs in
+the list view; open `basketball_daily` to see them.
 
 ---
 
-## 8. Alerts: Slack and the heartbeat
+## 8. Alerts
 
-Two separate alarms, covering two different failures:
+Two separate alert paths, because they cover different failures.
 
-| Situation | Who notices | How |
-|---|---|---|
-| The pipeline ran and a task failed | Airflow | Red message in Slack `#pipeline-alerts` |
-| The pipeline ran and finished | Airflow | Green message in Slack `#pipeline-alerts` |
-| The pipeline **did not run at all** (laptop asleep, Docker down) | Healthchecks.io (outside this machine) | Posts to Slack when the daily ping is missing |
+**1. Slack messages (`dags/slack_alert.py`, used by `dags/basketball_daily.py`)**
+- **Red message:** sent by the DAG's `on_failure_callback` only after a
+  task has failed for good, i.e. after its retries are used up. It does not
+  fire for `up_for_retry` or `upstream_failed`. It names the day, the task,
+  the number of attempts, a hint for that task (what usually goes wrong and
+  what to check first) and a link to the task log. The callback only knows the
+  exit code of a BashOperator, not the script's own message, so the hint and
+  the log link carry the detail.
+- **Green message:** sent by the `notify_success` task after `run_checks`
+  passes. It shows how many games were loaded for the day and how many
+  quarantine rows are open. If the day has 0 games it adds a warning.
+- If sending to Slack itself fails, the error is logged and the task is not
+  failed by it.
 
-Airflow cannot report a run that never started, which is why the second alarm
-lives on a service outside the laptop.
+**2. Healthchecks.io dead man's switch (`dags/healthcheck_ping.py`)**
+- The `ping_healthcheck` task pings a Healthchecks.io URL after a green run.
+  If the ping does not arrive on time, Healthchecks.io alerts Slack by its own
+  integration. This covers the case Airflow cannot report: **the pipeline
+  never ran at all** (PC off, Docker stopped, scheduler dead).
+- It must live outside the pipeline machine, which is why it is an external
+  service.
+- Tested by hand: a missed ping produced a "test is down" message in Slack.
 
-### Slack messages (from `dags/basketball_daily.py`)
-- **Red message:** sent by `on_failure_callback` on every task, only after a
-  task has failed **for good** (for `fetch_daily` that means after its two
-  retries). It shows the task, the number of attempts, the day, the error, a
-  link to the log and a hint of what to check first. Tasks that did not run
-  because an earlier one failed (`upstream_failed`) send nothing, so one root
-  cause gives one alert.
-- **The error line only holds the exit code.** The scripts run through
-  `BashOperator`, whose exception says "Bash command failed. The command
-  returned a non-zero exit code 1." The script's own message (for example an
-  HTTP 429) stays in the task log. Open the log link.
-- **Green message:** sent by `notify_success`. It shows the day, how many games
-  `fact_games` holds for that day, and the open quarantine count. If the day has
-  0 games it adds a warning line.
-- **No green message by about 08:00 Lagos time means the run needs a look.**
-- The log link uses `http://localhost:8080`, so it only opens on the laptop
-  where Airflow runs.
-- The Slack helper is `dags/slack_alert.py`. The webhook URL is read from
-  `SLACK_WEBHOOK_URL` and is never logged. If Slack cannot be reached,
-  the failure callback logs the problem and does not crash; `notify_success`
-  fails and retries, so an undelivered alert is never mistaken for success.
-
-Test the Slack helper by hand:
-```
-MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler python /opt/airflow/dags/slack_alert.py "test message"
-```
-
-### Healthchecks.io (the dead man's switch)
-- Check name `basketball_daily`, expected once a day on the cron schedule
-  `0 6 * * *` in UTC, with a grace time of 30 minutes. If no ping arrives by
-  then, Healthchecks.io posts to `#pipeline-alerts` through its own Slack
-  integration. (The values are set on the Healthchecks.io website; check them
-  there if this ever changes.)
-- `ping_healthcheck` sends the ping after `run_checks` succeeds. The helper is
-  `dags/healthcheck_ping.py`, and the URL is read from `HEALTHCHECK_PING_URL`.
-  **Treat the ping URL as a secret:** anyone who has it can send "all fine"
-  pings that hide a real outage.
-- A run that needs a fetch retry can finish close to the end of the grace
-  time. If it ever sends a false alarm, Healthchecks.io also reports when the
-  ping finally arrives; widen the grace time if it happens again.
-
-Test the ping by hand (also marks the check as received for today):
-```
-MSYS_NO_PATHCONV=1 docker compose exec airflow-scheduler python /opt/airflow/dags/healthcheck_ping.py
-```
-Test the Slack link from Healthchecks.io with the test-notification button of
-its Slack integration.
+Both modules can be tested by hand by running them inside the scheduler
+container (see the Git Bash note in section 7); each prints a short result and
+exits 0 on success, 1 on failure. **Neither URL is ever printed or logged.**
 
 ---
 
@@ -487,13 +430,7 @@ the old and new file by `match_id` and writes
 
 `state.clock` is ignored: a finished game shows clock 10 at first and `None`
 later, which is noise. This is snapshot comparison, not real CDC. It is how we
-found that scores get revised (for example games turning into overtime) and
-that late games appear on re-fetch (2026-10-25: 249 -> 252 games, 3 new).
-
-The files stay the source of truth. A table for them is possible later (a
-separate load step), after about two weeks of reports. The question to answer
-first: how long after the first fetch do late games appear, and is the
-two-day window enough?
+found that scores get revised (for example games turning into overtime).
 
 ---
 
@@ -506,8 +443,6 @@ two-day window enough?
   ignores the reserve and may use everything.
 - A full day is usually several pages of 100 games, so one day costs
   several requests.
-- `backfill.py` and the DAG share one key. A backfill after 1 AM Lagos can
-  exhaust the quota before the 07:00 run. Set `QUOTA_RESERVE` accordingly.
 
 ---
 
@@ -523,12 +458,11 @@ Keys only. **Values are never written here or committed.**
 
 - `.env`, `logs/`, `raw/`, `venv/` are in `.gitignore`. Check `git status`
   before every commit.
+- `SLACK_WEBHOOK_URL` and `HEALTHCHECK_PING_URL` are secrets: anyone with
+  them can post to your Slack or fake a heartbeat. Never paste them in chat
+  or commit them.
 - A value already in the environment wins over the same name loaded later by
   `python-dotenv`, so containers need recreating after a `.env` change.
-  Check a value reached a container without printing it:
-  `docker compose exec airflow-scheduler python -c "import os; print('set' if os.getenv('SLACK_WEBHOOK_URL') else 'missing')"`
-- `SLACK_WEBHOOK_URL` and `HEALTHCHECK_PING_URL` are secrets. Never paste them
-  in chat or commit them.
 - Before restricting access on any real database, confirm a recovery path
   that does not depend on that access.
 
@@ -543,57 +477,66 @@ python load_games.py      # load the new files
 python run_checks.py      # check the whole table
 ```
 
-**Check on a failed daily run (a red Slack message arrived):**
-1. Open the log link from the message, or the Airflow UI, and find the red task.
+**Check on a failed daily run:**
+1. Read the red Slack message (day, task, hint, log link) or open the
+   Airflow UI and find the red task.
 2. Read its log from the bottom up.
 3. Fetch failed: quota or network. Load failed: read the traceback.
    Checks failed: read the `ERROR` lines.
-4. Fix, then clear the failed task with Downstream ticked (section 7).
+4. Fix, then Clear the failed task with Downstream, or re-run the whole day.
 
-**No green message and no red one by 08:00 Lagos:** check whether the laptop
-was on and Docker Desktop running at 06:00 UTC. If Healthchecks.io also posted
-that the ping is late, the run did not happen or did not finish.
+**No Slack message at all by about 07:30 Lagos:** the pipeline probably did
+not run. Healthchecks.io will have alerted. Check that the PC is on and
+Docker is running (`docker compose ps`).
 
 ---
 
-## 13. Known limitations and to-do
+## 13. Open items and known limitations
 
-- The Slack error line holds only the exit code, not the script's own message
-  (section 8). Reading the last log line into the alert is possible later.
-- The log link in the alert only opens on the laptop running Airflow.
-- The red-path callback was tested by calling the function with a fake failure,
-  not by a real failing task. The first real failure is its real test.
-- The backend run is not yet triggered by this pipeline (idea: a further task
-  after `run_checks`, so it only runs when the pipeline succeeded).
-- 149 games are in open quarantine (70 ambiguous club; the rest are score
-  problems, same-team ids and one missing overtime score). They are not lost,
-  only waiting for review.
-- A stricter rule does not delete already-loaded rows (see section 5).
-- A `fixed` quarantine row hides a repeat of the same reason (section 5).
-- League corrections are added by hand after research. Nothing detects a
-  misfiled game except the shared-id check in `run_checks.py`.
+**Data items (named gaps, not lost):**
+- **118 open quarantine games**, as of 2026-11-02: 58 with a zero quarter
+  (49 in q1, 3 in q2, 2 in q3, 4 in q4), 28 with no final score (some may be
+  late results), 20 ambiguous club, 5 with the same team on both sides, 4
+  half-style, 3 other (1 overtime score missing, 2 quarter sums wrong).
+- **The 20 ambiguous-club games:** Al Ahli (API id 816893) in WASL, 9 games;
+  Brescia (610951) in league 165878, 5 games; Gorica (352247) in league
+  173537, 3; Penarol (250127) in league 255233, 2; Toledo (174388) in league
+  12698 (NIT), 1.
+- **The Brescia override row for league 165878 is in the seed file but was
+  never run in the live database.** Verify the 5 games against a real source,
+  then insert it.
+- **Sagesse Beirut has two API ids** (5349319 and 5502499). They are treated
+  as two clubs, so its game history is split. Matters for the dbt layer.
+- **303 games are in `abnormal_results`.** One-off low scores that are not
+  zero (for example 22-4 and 38-5) have not been examined.
+- **Leagues with a different format:** BIG3 (3-on-3, about 92 points a game)
+  and all-star or exhibition games filed under normal leagues. Team-based
+  numbers (form, head-to-head) are not affected because those teams have their
+  own ids, but league-wide statistics should exclude them.
+
+**Missing checks:**
+- No `run_checks` rule yet that one `club_id` must not carry two different
+  club names (it would have caught the 2026-11-02 collisions).
+- No check that a game is never in both `fact_games` and `abnormal_results`.
+  The loader moves games out of `fact_games` but does not remove a game from
+  `abnormal_results` if the API later adds quarter scores.
 - The shared-id check only compares countries. A shared id inside one
-  country would not be caught.
-- One game per id/league can only map to one club, so a shared id inside
-  one league cannot be split.
-- A full load reprocesses every file (about 3.5 minutes). A "skip unchanged
-  files" step is possible later.
-- The pipeline connects as the main database user. A limited pipeline role
-  is planned.
-- Planned: dbt metrics layer, S3 backup of `raw/`, unit tests for the
-  validation rules, GitHub Actions, Alembic migrations, moving to a Linux server.
+  country is not caught.
+- One `(api_team_id, league_id)` can map to only one club in
+  `club_id_overrides`; a shared id inside one league needs per-game
+  `club_corrections`.
 
-### Known data issues in the API
-- The same team id can belong to different clubs (shared ids, section 6).
-- 24 games were filed under the wrong league: 23 UK WBBL games under Spain
-  "Liga Femenina Women" (80778) and 1 Lithuanian game under Greece
-  "Basket League" (39079). They are fixed through `league_corrections` (the
-  match ids are in `sql/02_seed_lookups.sql`). Both leagues are real, so
-  neither is in `international_leagues`.
-- Generic all-star teams "East" and "West" share ids across NBA and the
-  Czech NBL; they are handled with override rows.
-- Scores are sometimes revised after the game (for example into overtime), and
-  late games can appear on re-fetch.
+**Pipeline items:**
+- The backend run is not yet triggered by this pipeline (idea: a fourth task,
+  so it only runs when the pipeline succeeded).
+- The red Slack message has only been tested with a fake failure; the first
+  real failure is the real test.
+- Skipping unchanged files on load, a change-report table, a limited
+  pipeline database role, and quarantine-reopen logic (reopen `fixed`, not
+  `ignored`) are not done.
+- Backfill depth (how far back to fetch) is still an open decision.
+- Planned: dbt metrics layer, S3 backup of `raw/`, unit tests for the
+  validation rules, GitHub Actions, Alembic migrations.
 
 ---
 
@@ -601,8 +544,9 @@ that the ping is late, the run did not happen or did not finish.
 
 - No secrets in code or in Git.
 - Every script does one thing and exits non-zero on failure.
-- Lookup changes go in `sql/02_seed_lookups.sql` (and the table definition in
-  `sql/01_schema.sql`) and are committed.
-- Raw files are never edited. Fixes are lookup rows applied by the loader.
+- Lookup changes go in `sql/02_seed_lookups.sql` and are committed.
+- Table definitions go in `sql/01_schema.sql` and are committed.
 - Reloading is always safe (upserts).
-- Use `TRUNCATE ... RESTART IDENTITY` (not `DELETE`) when clearing a table.
+- A `club_id` belongs to exactly one real club.
+- Verify a club or league against a real source before adding a row; keep
+  the source in the row's `note`.
