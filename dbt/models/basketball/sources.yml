@@ -1,0 +1,7 @@
+version: 2
+
+sources:
+  - name: basketball
+    schema: basketball
+    tables:
+      - name: fact_games
