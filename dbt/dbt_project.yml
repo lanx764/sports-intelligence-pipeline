@@ -1,0 +1,12 @@
+name: 'sports_intelligence'
+version: '1.0.0'
+profile: 'sports_intelligence'
+
+model-paths: ["models"]
+
+models:
+  sports_intelligence:
+    basketball:
+      +materialized: table
+      staging:
+        +materialized: view
