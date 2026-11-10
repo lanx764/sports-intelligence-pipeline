@@ -51,9 +51,12 @@ and quarantine rows are de-duplicated on (match_id, reason).
 After a full load, a league or club correction whose match_id was not found
 in any raw file is reported as a warning (most likely a mistyped id).
 
-Known limit: a game already in abnormal_results is not removed from it if a
-later raw file turns it into a normal game (for example the API adds
-quarter scores). That should be caught by a check, not by the loader.
+The newest fetch always wins. The daily run re-fetches the two previous
+days, so a game can change between runs: for example the API first sends a
+finished game as 0 - 0 and a day later with its real score. Whichever table
+the newest raw file puts a game in, the loader removes it from the other
+one (fact_games or abnormal_results) in the same transaction, so a game is
+never in both.
 """
 
 import json
@@ -108,7 +111,7 @@ ABNORMAL_COLUMNS = (
 
 STAT_KEYS = (
     "rows", "loaded", "quarantined", "filtered", "resolved",
-    "corrected", "club_corrected", "abnormal", "removed",
+    "corrected", "club_corrected", "abnormal", "removed", "removed_abnormal",
 )
 
 columns_sql = ", ".join(FACT_COLUMNS)
@@ -141,6 +144,11 @@ ON CONFLICT (match_id) DO UPDATE SET
 
 DELETE_FROM_FACT_SQL = """
 DELETE FROM basketball.fact_games
+WHERE match_id = %s
+"""
+
+DELETE_FROM_ABNORMAL_SQL = """
+DELETE FROM basketball.abnormal_results
 WHERE match_id = %s
 """
 
@@ -549,6 +557,16 @@ def process_file(
                 else:
                     cur.execute(UPSERT_SQL, row)
                     stats["loaded"] += 1
+
+                    # An earlier run may have stored it as abnormal (for example
+                    # 0 - 0 before the API had the real score). Newest fetch wins.
+                    cur.execute(DELETE_FROM_ABNORMAL_SQL, (match.id,))
+                    if cur.rowcount:
+                        stats["removed_abnormal"] += cur.rowcount
+                        log.info(
+                            "%s: match %s is now a normal game - removed from abnormal_results",
+                            path.name, match.id,
+                        )
                     if correction is not None:
                         stats["corrected"] += 1
                     if club_fixes is not None:
@@ -677,11 +695,12 @@ def main():
                 totals[key] += stats[key]
 
     log.info(
-        "done: %d files, %d rows -> %d loaded, %d abnormal (%d removed from fact_games), "
+        "done: %d files, %d rows -> %d loaded (%d removed from abnormal_results), "
+        "%d abnormal (%d removed from fact_games), "
         "%d quarantined, %d not finished, %d quarantine rows marked fixed, "
         "%d league corrections applied, %d club corrections applied",
-        len(files) - len(failed), totals["rows"], totals["loaded"], totals["abnormal"],
-        totals["removed"], totals["quarantined"], totals["filtered"], totals["resolved"],
+        len(files) - len(failed), totals["rows"], totals["loaded"], totals["removed_abnormal"],
+        totals["abnormal"], totals["removed"], totals["quarantined"], totals["filtered"], totals["resolved"],
         totals["corrected"], totals["club_corrected"],
     )
 
