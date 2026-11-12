@@ -53,10 +53,18 @@ in any raw file is reported as a warning (most likely a mistyped id).
 
 The newest fetch always wins. The daily run re-fetches the two previous
 days, so a game can change between runs: for example the API first sends a
-finished game as 0 - 0 and a day later with its real score. Whichever table
-the newest raw file puts a game in, the loader removes it from the other
-one (fact_games or abnormal_results) in the same transaction, so a game is
-never in both.
+finished game as 0 - 0 and a day later with its real score, or first as
+"Finished" with no score and a day later as "Postponed". Whatever the newest
+raw file says about a game, the loader makes the database match it, in the
+same transaction, so a game is never in two places and never left behind:
+  - finished, clean:      in fact_games only; its open quarantine rows are
+                          marked 'fixed'
+  - finished, abnormal:   in abnormal_results only
+  - finished, a problem:  in quarantine_games only (removed from fact_games
+                          and abnormal_results)
+  - not finished:         nowhere (removed from fact_games and
+                          abnormal_results, and its open quarantine rows
+                          are deleted, because nothing is wrong any more)
 """
 
 import json
@@ -111,7 +119,8 @@ ABNORMAL_COLUMNS = (
 
 STAT_KEYS = (
     "rows", "loaded", "quarantined", "filtered", "resolved",
-    "corrected", "club_corrected", "abnormal", "removed", "removed_abnormal",
+    "corrected", "club_corrected", "abnormal",
+    "removed", "removed_abnormal", "dropped_quarantine",
 )
 
 columns_sql = ", ".join(FACT_COLUMNS)
@@ -150,6 +159,12 @@ WHERE match_id = %s
 DELETE_FROM_ABNORMAL_SQL = """
 DELETE FROM basketball.abnormal_results
 WHERE match_id = %s
+"""
+
+DELETE_OPEN_QUARANTINE_SQL = """
+DELETE FROM basketball.quarantine_games
+WHERE match_id = %s
+  AND status = 'open'
 """
 
 QUARANTINE_SQL = """
@@ -489,6 +504,19 @@ def build_row(match, resolver, half_style_ids, correction=None, club_fixes=None)
 # ---------------------------------------------------------------------------
 # Load
 # ---------------------------------------------------------------------------
+def remove_stale(cur, sql, match_id, stats, key, file_name, message):
+    """
+    Run one DELETE for one game. If it removed anything, count it under
+    stats[key] and log it. A game with no id (a broken record) is skipped.
+    """
+    if match_id is None:
+        return
+    cur.execute(sql, (match_id,))
+    if cur.rowcount:
+        stats[key] += cur.rowcount
+        log.info("%s: match %s %s", file_name, match_id, message)
+
+
 def process_file(
     conn, path, resolver, half_style_ids,
     corrections, club_corrections, seen_corrections, seen_club_corrections,
@@ -526,9 +554,20 @@ def process_file(
             if club_fixes is not None:
                 seen_club_corrections.add(raw.get("id"))
 
+            match_id = raw.get("id")
+
             state = (raw.get("state") or {}).get("description")
             if state not in FINISHED_STATES:
                 stats["filtered"] += 1
+                # An earlier fetch may have said "Finished" (loaded, abnormal
+                # or quarantined). The newest fetch says it is not, so
+                # nothing from the old state is true any more.
+                remove_stale(cur, DELETE_FROM_FACT_SQL, match_id, stats, "removed", path.name,
+                             "is no longer finished - removed from fact_games")
+                remove_stale(cur, DELETE_FROM_ABNORMAL_SQL, match_id, stats, "removed_abnormal", path.name,
+                             "is no longer finished - removed from abnormal_results")
+                remove_stale(cur, DELETE_OPEN_QUARANTINE_SQL, match_id, stats, "dropped_quarantine", path.name,
+                             "is no longer finished - deleted its open quarantine row(s)")
                 continue
 
             try:
@@ -552,21 +591,16 @@ def process_file(
                     stats["abnormal"] += 1
 
                     # An earlier run may have loaded it as a normal game.
-                    cur.execute(DELETE_FROM_FACT_SQL, (match.id,))
-                    stats["removed"] += cur.rowcount
+                    remove_stale(cur, DELETE_FROM_FACT_SQL, match.id, stats, "removed", path.name,
+                                 "is now abnormal - removed from fact_games")
                 else:
                     cur.execute(UPSERT_SQL, row)
                     stats["loaded"] += 1
 
                     # An earlier run may have stored it as abnormal (for example
                     # 0 - 0 before the API had the real score). Newest fetch wins.
-                    cur.execute(DELETE_FROM_ABNORMAL_SQL, (match.id,))
-                    if cur.rowcount:
-                        stats["removed_abnormal"] += cur.rowcount
-                        log.info(
-                            "%s: match %s is now a normal game - removed from abnormal_results",
-                            path.name, match.id,
-                        )
+                    remove_stale(cur, DELETE_FROM_ABNORMAL_SQL, match.id, stats, "removed_abnormal", path.name,
+                                 "is now a normal game - removed from abnormal_results")
                     if correction is not None:
                         stats["corrected"] += 1
                     if club_fixes is not None:
@@ -581,9 +615,16 @@ def process_file(
                     )
                 continue
 
-            cur.execute(QUARANTINE_SQL, (raw.get("id"), Jsonb(raw), reason, path.name))
+            # The newest fetch says this game has a problem, so an earlier
+            # clean or abnormal copy of it can no longer be trusted.
+            remove_stale(cur, DELETE_FROM_FACT_SQL, match_id, stats, "removed", path.name,
+                         "is now quarantined - removed from fact_games")
+            remove_stale(cur, DELETE_FROM_ABNORMAL_SQL, match_id, stats, "removed_abnormal", path.name,
+                         "is now quarantined - removed from abnormal_results")
+
+            cur.execute(QUARANTINE_SQL, (match_id, Jsonb(raw), reason, path.name))
             stats["quarantined"] += 1
-            log.warning("%s: match %s quarantined: %s", path.name, raw.get("id"), reason)
+            log.warning("%s: match %s quarantined: %s", path.name, match_id, reason)
 
     accounted = stats["loaded"] + stats["abnormal"] + stats["quarantined"] + stats["filtered"]
     if accounted != stats["rows"]:
@@ -695,13 +736,17 @@ def main():
                 totals[key] += stats[key]
 
     log.info(
-        "done: %d files, %d rows -> %d loaded (%d removed from abnormal_results), "
-        "%d abnormal (%d removed from fact_games), "
-        "%d quarantined, %d not finished, %d quarantine rows marked fixed, "
-        "%d league corrections applied, %d club corrections applied",
-        len(files) - len(failed), totals["rows"], totals["loaded"], totals["removed_abnormal"],
-        totals["abnormal"], totals["removed"], totals["quarantined"], totals["filtered"], totals["resolved"],
+        "done: %d files, %d rows -> %d loaded, %d abnormal, %d quarantined, %d not finished, "
+        "%d quarantine rows marked fixed, %d league corrections applied, %d club corrections applied",
+        len(files) - len(failed), totals["rows"], totals["loaded"], totals["abnormal"],
+        totals["quarantined"], totals["filtered"], totals["resolved"],
         totals["corrected"], totals["club_corrected"],
+    )
+    log.info(
+        "stale rows cleaned up (the newest fetch changed these games): "
+        "%d removed from fact_games, %d removed from abnormal_results, "
+        "%d open quarantine rows deleted",
+        totals["removed"], totals["removed_abnormal"], totals["dropped_quarantine"],
     )
 
     # Only a full load sees every raw file, so only then can an unused
